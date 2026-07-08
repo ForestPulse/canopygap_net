@@ -47,15 +47,34 @@ class AttentionGate(nn.Module):
         return x * psi + x
 
 class Sentinel2ResUNet(nn.Module):
-    def __init__(self, in_channels=10, s1_in_channels=3):
+    def __init__(self, in_channels=220, s1_in_channels=3, base_channels=64):
         super().__init__()
         self.pool = nn.MaxPool2d(2)
 
-        # --- S2 encoders  ---
-        self.enc1a = ResidualUNetBlock(in_channels, 64, kernel_size=3)
-        self.enc1b = ResidualUNetBlock(in_channels, 64, kernel_size=7)
+        self.s2_stem = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, kernel_size=1),
+            nn.GroupNorm(8, base_channels),
+            nn.ReLU(inplace=True),
+        )
 
-        # enc2* will now receive fused features (still 64ch, 128x128)
+        self.s1_stem = nn.Sequential(
+            nn.Conv2d(s1_in_channels, 32, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, base_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(8, base_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        self.fuse0 = nn.Sequential(
+            nn.Conv2d(base_channels * 2, base_channels, kernel_size=1),
+            nn.GroupNorm(8, base_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        self.enc1a = ResidualUNetBlock(base_channels, 64, kernel_size=3)
+        self.enc1b = ResidualUNetBlock(base_channels, 64, kernel_size=7)
+
         self.enc2a = ResidualUNetBlock(64, 128, kernel_size=3)
         self.enc2b = ResidualUNetBlock(64, 128, kernel_size=7)
 
@@ -64,29 +83,10 @@ class Sentinel2ResUNet(nn.Module):
 
         self.bottleneck = ResidualUNetBlock(256, 512)
 
-        # --- S1 stem to 64ch at 128x128 ---
-        self.s1_stem = nn.Sequential(
-            nn.Conv2d(s1_in_channels, 32, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.ReLU(inplace=True),
-        )
-
-        # --- Fusion block (concat then 1x1 to 64ch) ---
-        self.fuse1 = nn.Sequential(
-            nn.Conv2d(64 + 64, 64, kernel_size=1),
-            nn.GroupNorm(8, 64),
-            nn.ReLU(inplace=True),
-        )
-
-        # Attention gates
         self.att3 = AttentionGate(F_g=256, F_l=256, F_int=128)
         self.att2 = AttentionGate(F_g=128, F_l=128, F_int=64)
-        self.att1 = AttentionGate(F_g=64,  F_l=64,  F_int=32)
+        self.att1 = AttentionGate(F_g=64, F_l=64, F_int=32)
 
-        # Decoder 
         self.up3 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
         self.dec3 = ResidualUNetBlock(512, 256)
 
@@ -100,42 +100,39 @@ class Sentinel2ResUNet(nn.Module):
 
     def forward(self, s2, s1):
         """
-        s2: (B, 10, 256, 256)
-        s1: (B, s1_in_channels, 128, 128)
+        s2: (B, 220, 256, 256)
+        s1: (B,   3, 256, 256)
         """
-        # --- Encoder level 1 (256x256) ---
-        e1a = self.enc1a(s2)
-        e1b = self.enc1b(s2)
-        e1  = e1a + e1b  # (B,64,256,256)
+        s2f = self.s2_stem(s2)
+        s1f = self.s1_stem(s1)
 
-        # --- Fuse at 128x128 ---
-        p1 = self.pool(e1)                 # (B,64,128,128)
-        s1f = self.s1_stem(s1)             # (B,64,128,128)
-        p1  = self.fuse1(torch.cat([p1, s1f], dim=1))  # (B,64,128,128)
+        x0 = self.fuse0(torch.cat([s2f, s1f], dim=1))
 
-        # --- Encoder level 2 (128x128 -> 64x64) ---
+        e1a = self.enc1a(x0)
+        e1b = self.enc1b(x0)
+        e1 = e1a + e1b
+
+        p1 = self.pool(e1)
         e2a = self.enc2a(p1)
         e2b = self.enc2b(p1)
-        e2  = e2a + e2b                    # (B,128,128,128)
+        e2 = e2a + e2b
 
-        # IMPORTANT: downstream uses pooled branches just like before
-        e3a = self.enc3a(self.pool(e2a))
-        e3b = self.enc3b(self.pool(e2b))
-        e3  = e3a + e3b                    # (B,256,64,64)
+        p2 = self.pool(e2)
+        e3a = self.enc3a(p2)
+        e3b = self.enc3b(p2)
+        e3 = e3a + e3b
 
-        # Bottleneck (32x32)
-        b = self.bottleneck(self.pool(e3)) # (B,512,32,32)
+        b = self.bottleneck(self.pool(e3))
 
-        # --- Decoder with attention (as before) ---
-        d3 = self.up3(b)                   # (B,256,64,64)
-        e3g = self.att3(d3, e3)            # gated skip
+        d3 = self.up3(b)
+        e3g = self.att3(d3, e3)
         d3 = self.dec3(torch.cat([d3, e3g], dim=1))
 
-        d2 = self.up2(d3)                  # (B,128,128,128)
+        d2 = self.up2(d3)
         e2g = self.att2(d2, e2)
         d2 = self.dec2(torch.cat([d2, e2g], dim=1))
 
-        d1 = self.up1(d2)                  # (B,64,256,256)
+        d1 = self.up1(d2)
         e1g = self.att1(d1, e1)
         d1 = self.dec1(torch.cat([d1, e1g], dim=1))
 
