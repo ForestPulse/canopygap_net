@@ -7,12 +7,11 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Subset
+from torch.utils.data import Sampler
 
 from models.gap_net import Sentinel2ResUNet
-from datasets.raster_datasets import S2S1GapFractionTileFolderDataset
-from datasets.npz_dataset import CachedNPZGapFractionDataset
+from datasets.raster_datasets import S2S1GapFractionNPZDataset
 import config
 
 
@@ -22,7 +21,43 @@ def sse_and_count(pred: torch.Tensor, target: torch.Tensor):
     n = diff.numel()
     return sse, n
 
+class RandomSubsetSampler(Sampler):
+    """
+    Draw a new random subset whenever the DataLoader starts a new epoch.
+    """
 
+    def __init__(
+        self,
+        data_source,
+        num_samples,
+        seed=42,
+    ):
+        self.data_source = data_source
+        self.num_samples = min(
+            int(num_samples),
+            len(data_source),
+        )
+
+        if self.num_samples < 1:
+            raise ValueError(
+                "TRAIN_CHIPS_PER_EPOCH must be at least 1."
+            )
+
+        self.generator = torch.Generator()
+        self.generator.manual_seed(int(seed))
+
+    def __iter__(self):
+        indices = torch.randperm(
+            len(self.data_source),
+            generator=self.generator,
+        )[:self.num_samples]
+
+        return iter(indices.tolist())
+
+    def __len__(self):
+        return self.num_samples
+
+        
 # -------------------------
 # Logging setup
 # -------------------------
@@ -36,8 +71,6 @@ logging.basicConfig(
 )
 logging.info("Starting gap-fraction spline training run")
 
-tb_log_dir = getattr(config, "TB_LOG_DIR", "runs/gap_spline")
-writer = SummaryWriter(log_dir=tb_log_dir)
 
 
 # -------------------------
@@ -58,8 +91,15 @@ logging.info(f"Using device: {device}")
 # -------------------------
 # Datasets
 # -------------------------
-train_ds = CachedNPZGapFractionDataset(config.TRAIN_CACHE_ROOT)
-val_ds = CachedNPZGapFractionDataset(config.VAL_CACHE_ROOT)
+train_ds = S2S1GapFractionNPZDataset(
+    root_dir=config.TRAIN_ROOT,
+    label_subdir=config.LABEL_SUBDIR,
+)
+
+val_ds = S2S1GapFractionNPZDataset(
+    root_dir=config.VAL_ROOT,
+    label_subdir=config.LABEL_SUBDIR,
+)
 
 logging.info(f"Train tiles: {len(train_ds)} | Val tiles: {len(val_ds)}")
 
@@ -68,18 +108,100 @@ logging.info(f"Train tiles: {len(train_ds)} | Val tiles: {len(val_ds)}")
 # DataLoaders
 # -------------------------
 num_workers = getattr(config, "NUM_WORKERS", 4)
+persistent_workers = num_workers > 0
 
+# A new training subset is drawn whenever train_loader is iterated.
+train_chips_per_epoch = min(
+    int(
+        getattr(
+            config,
+            "TRAIN_CHIPS_PER_EPOCH",
+            len(train_ds),
+        )
+    ),
+    len(train_ds),
+)
+
+train_seed = int(
+    getattr(
+        config,
+        "TRAIN_SEED",
+        42,
+    )
+)
+
+train_sampler = RandomSubsetSampler(
+    train_ds,
+    num_samples=train_chips_per_epoch,
+    seed=train_seed,
+)
+
+train_loader = DataLoader(
+    train_ds,
+    batch_size=config.BATCH_SIZE,
+    sampler=train_sampler,
+    shuffle=False,
+    num_workers=num_workers,
+    pin_memory=(device.type == "cuda"),
+    drop_last=True,
+    persistent_workers=persistent_workers,
+)
+
+# Select one fixed validation subset.
+validation_chips = min(
+    int(
+        getattr(
+            config,
+            "VALIDATION_CHIPS",
+            len(val_ds),
+        )
+    ),
+    len(val_ds),
+)
+
+if validation_chips < 1:
+    raise ValueError(
+        "VALIDATION_CHIPS must be at least 1."
+    )
+
+validation_seed = int(
+    getattr(
+        config,
+        "VALIDATION_SEED",
+        42,
+    )
+)
+
+validation_generator = torch.Generator()
+validation_generator.manual_seed(validation_seed)
+
+validation_indices = torch.randperm(
+    len(val_ds),
+    generator=validation_generator,
+)[:validation_chips].tolist()
+
+val_subset = Subset(
+    val_ds,
+    validation_indices,
+)
 
 val_loader = DataLoader(
-    val_ds,
+    val_subset,
     batch_size=config.BATCH_SIZE,
     shuffle=False,
     num_workers=num_workers,
     pin_memory=(device.type == "cuda"),
     drop_last=False,
-    persistent_workers=(num_workers > 0),
+    persistent_workers=persistent_workers,
 )
 
+logging.info(
+    f"Training chips per epoch: {len(train_sampler)} / {len(train_ds)}"
+)
+
+logging.info(
+    f"Fixed validation chips: {len(val_subset)} / {len(val_ds)}"
+)
 
 # -------------------------
 # Model / loss / optimizer
@@ -116,25 +238,10 @@ Path(model_out).parent.mkdir(parents=True, exist_ok=True)
 # -------------------------
 # Training Loop
 # -------------------------
-global_step = 0
+
 
 for epoch in range(config.EPOCHS):
 
-    samples_per_epoch = getattr(config, "TRAIN_SAMPLES_PER_EPOCH", len(train_ds))
-    samples_per_epoch = min(samples_per_epoch, len(train_ds))
-
-    epoch_indices = torch.randperm(len(train_ds))[:samples_per_epoch].tolist()
-    train_epoch_ds = Subset(train_ds, epoch_indices)
-
-    train_loader = DataLoader(
-        train_epoch_ds,
-        batch_size=config.BATCH_SIZE,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        drop_last=True,
-        persistent_workers=False,
-    )
 
     model.train()
 
@@ -174,9 +281,6 @@ for epoch in range(config.EPOCHS):
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-
-            global_step += 1
-            writer.add_scalar("GradNorm/train", float(grad_norm), global_step)
 
         if step % 100 == 0:
             logging.info(
@@ -224,12 +328,6 @@ for epoch in range(config.EPOCHS):
         scheduler.step(avg_val_rmse)
         current_lr = optimizer.param_groups[0]["lr"]
 
-        writer.add_scalar("Loss/train", avg_train_loss, epoch + 1)
-        writer.add_scalar("RMSE/train", avg_train_rmse, epoch + 1)
-        writer.add_scalar("Loss/val", avg_val_loss, epoch + 1)
-        writer.add_scalar("RMSE/val", avg_val_rmse, epoch + 1)
-        writer.add_scalar("LR", current_lr, epoch + 1)
-
         logging.info(
             f"Epoch {epoch + 1}/{config.EPOCHS} - "
             f"Train Loss: {avg_train_loss:.4f}, RMSE: {avg_train_rmse:.4f} | "
@@ -254,9 +352,6 @@ for epoch in range(config.EPOCHS):
     else:
         current_lr = optimizer.param_groups[0]["lr"]
 
-        writer.add_scalar("Loss/train", avg_train_loss, epoch + 1)
-        writer.add_scalar("RMSE/train", avg_train_rmse, epoch + 1)
-        writer.add_scalar("LR", current_lr, epoch + 1)
 
         logging.info(
             f"Epoch {epoch + 1}/{config.EPOCHS} - "
@@ -264,5 +359,3 @@ for epoch in range(config.EPOCHS):
             f"Val skipped | "
             f"LR: {current_lr:.2e}"
         )
-
-writer.close()
