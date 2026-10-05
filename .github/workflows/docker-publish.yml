@@ -1,0 +1,43 @@
+name: Docker
+
+on:
+  workflow_run:
+    workflows: [Git-Tag]
+    types: [completed]
+
+permissions:
+  packages: write
+  contents: read
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/canopy_gap
+
+jobs:
+  push:
+    name: Push image to GitHub Container Registry
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        variant: [cpu, gpu]
+    steps:
+      - name: convert image name to lower case
+        run: echo "IMAGE_NAME_LC=${IMAGE_NAME,,}" >>${GITHUB_ENV}
+      - name: Check out the repo
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - name: Docker login
+        run: echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Build image
+        run: docker build . --file Dockerfile --build-arg VARIANT=${{ matrix.variant }} --tag $IMAGE_NAME_LC-${{ matrix.variant }}
+      - name: Push image
+        run: |
+          # Fetch all tags
+          git fetch --tags
+          # Get the latest tag reachable from HEAD
+          VERSION=$(git describe --tags --abbrev=0)
+          echo VERSION=$VERSION
+          echo DOCKER=$DOCKER_USER/$IMAGE_NAME:$VERSION
+          docker tag $IMAGE_NAME_LC $IMAGE_NAME_LC:$VERSION
+          docker push $IMAGE_NAME_LC:$VERSION
+          # Also tag and push as latest
+          docker tag $IMAGE_NAME_LC $IMAGE_NAME_LC:latest
+          docker push $IMAGE_NAME_LC:latest
