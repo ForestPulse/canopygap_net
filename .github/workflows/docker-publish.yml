@@ -35,9 +35,9 @@ jobs:
           # Get the latest tag reachable from HEAD
           VERSION=$(git describe --tags --abbrev=0)
           echo VERSION=$VERSION
-          echo DOCKER=$DOCKER_USER/$IMAGE_NAME:$VERSION
-          docker tag $IMAGE_NAME_LC $IMAGE_NAME_LC:$VERSION
-          docker push $IMAGE_NAME_LC:$VERSION
+          echo DOCKER=$DOCKER_USER/$IMAGE_NAME:$VERSION-${{ matrix.variant }}
+          docker tag $IMAGE_NAME_LC-${{ matrix.variant }} $IMAGE_NAME_LC:$VERSION-${{ matrix.variant }}
+          docker push $IMAGE_NAME_LC:$VERSION-${{ matrix.variant }}
           # Also tag and push as latest
-          docker tag $IMAGE_NAME_LC $IMAGE_NAME_LC:latest
-          docker push $IMAGE_NAME_LC:latest
+          docker tag $IMAGE_NAME_LC-${{ matrix.variant }} $IMAGE_NAME_LC:latest-${{ matrix.variant }}
+          docker push $IMAGE_NAME_LC:latest-${{ matrix.variant }}
